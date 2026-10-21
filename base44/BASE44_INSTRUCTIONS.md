@@ -31,14 +31,16 @@ Ask Base44 to render it directly instead.
 
 ## Rebuild after changes
 
-The bundle source is in `src/`. It builds from the booking-site repo (the Higgsfield site code), which
-holds the shared components:
+The bundle source is in `../site/app/base44/` and builds from the booking-site code next to it, which
+holds the shared components (`site/app/src/components/raas`, `site/app/src/lib/raas.ts`):
 
 ```
-copy src\* <site repo>\app\base44\
-cd <site repo>\app
-npx vite build --config base44/vite.config.ts        # writes dist-base44/
+cd site/app
+bun install                                          # npm needs: --legacy-peer-deps, and workspace:* -> *
+npx vite build --config base44/vite.config.ts        # writes site/app/dist-base44/
 ```
+
+Zip `dist-base44/index.html`, `raas.js` and `raas.css` into `raas-page.zip`.
 
 `VITE_RAAS_API` overrides the API host (default `https://raas-api.sixthsenselabs.xyz`); the API must list
 the page's origin in `SITE_ORIGINS` (`render.yaml` already includes https://sixthsenselabs.xyz and

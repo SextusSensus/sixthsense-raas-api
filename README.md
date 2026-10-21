@@ -59,6 +59,18 @@ keep the renter terms in line with this.
 - Only completed rentals show up in `GET /api/admin/peaq-pending`; marking one posted is one-time (409
   on repeat).
 
+## Booking site (`site/`)
+
+`site/app` is the renter-facing booking site: React 19 + TanStack Start, deployed as a Cloudflare Worker
+on Higgsfield (https://sixthsense-raas.higgsfield.app). It is a copy of the Higgsfield site repo; deploys
+still go through Higgsfield, so copy changes back there (or re-export from there) to keep both in sync.
+
+- `src/components/raas/*`, `src/lib/raas.ts`: booking UI, Phantom sign-in and USDC payment, sessions.
+- `src/scroll-scrub-scenes.ts` + `public/assets/world/`: the K1 scroll film (5 seam-exact clips).
+- `src/server.ts`: proxies `/api/*` to `RAAS_API_URL` (default `https://raas-api.sixthsenselabs.xyz`).
+- `packages/`: Higgsfield-managed vendored packages the template's build needs; leave them as they are.
+- `base44/`: builds the drag-in RAAS page for the Base44 site (`../base44/BASE44_INSTRUCTIONS.md`).
+
 ## Clients
 
 - Robot agent (`robot_agent.py` on the K1): bearer `ROBOT_TOKEN`; polls `GET /api/robot/jobs`, pulls
