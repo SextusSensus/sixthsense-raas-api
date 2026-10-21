@@ -1,0 +1,53 @@
+# Render blueprint for the RAAS API. One instance only: SQLite + the file vault live on the disk.
+services:
+  - type: web
+    name: raas-api
+    runtime: python
+    plan: starter            # persistent disks need a paid plan
+    buildCommand: pip install -r requirements.txt
+    # --workers 1: SQLite + the per-booking upload locks assume one process (Render sets WEB_CONCURRENCY otherwise)
+    startCommand: "uvicorn server:app --host 0.0.0.0 --port $PORT --workers 1 --proxy-headers --forwarded-allow-ips='*'"
+    healthCheckPath: /api/config
+    disk:
+      name: raas-data
+      mountPath: /var/data
+      sizeGB: 10
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.14
+      - key: DATA_DIR
+        value: /var/data
+      # secrets: set in the Render dashboard, never in this file
+      - key: TREASURY_ADDRESS
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: VAULT_MASTER_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: ROBOT_TOKEN
+        sync: false
+      - key: ADMIN_WALLETS
+        sync: false
+      - key: SOLANA_RPC_URL
+        sync: false
+      # plain config
+      - key: USDC_MINT
+        value: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+      - key: PRICE_USDC_PER_HOUR
+        value: "25"
+      - key: OPERATOR_TZ
+        value: America/New_York
+      - key: SESSION_TYPES
+        value: operator-run,remote-view
+      - key: SITE_DOMAIN
+        value: sixthsense-raas.higgsfield.app
+      - key: SITE_ORIGIN
+        value: https://sixthsense-raas.higgsfield.app
+      - key: PUBLIC_API_URL
+        value: https://raas-api.sixthsenselabs.xyz
+      - key: MAX_UPLOAD_MB
+        value: "2048"
+      - key: RESULTS_TTL_HOURS
+        value: "72"

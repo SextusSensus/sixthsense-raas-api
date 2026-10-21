@@ -1,0 +1,25 @@
+[Unit]
+Description=Sixth Sense Labs RAAS robot agent (renter files <-> RAM disk)
+After=network-online.target mnt-raas.mount
+Wants=network-online.target
+# Fail closed: no tmpfs, no agent. The agent also refuses to start if RAAS_DIR is not a mount point.
+Requires=mnt-raas.mount
+
+[Service]
+Type=simple
+User=booster
+Group=booster
+EnvironmentFile=/home/booster/raas/agent.env
+WorkingDirectory=/home/booster/raas
+ExecStart=/usr/bin/python3 /home/booster/raas/robot_agent.py
+Nice=10
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+# The agent may write renter data only to the RAM disk; the rest of the filesystem is read-only to it.
+ProtectSystem=strict
+ReadWritePaths=/mnt/raas
+
+[Install]
+WantedBy=multi-user.target

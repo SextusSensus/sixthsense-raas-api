@@ -12,8 +12,10 @@ import hmac
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -33,16 +35,34 @@ import solana_pay
 import vault
 
 env = os.environ.get
+
+
+def _price_units(raw):
+    # Whole USDC base units (6 decimals); anything else is 0 so check_config refuses to boot.
+    try:
+        units = Decimal(raw) * 10**6
+    except ArithmeticError:  # decimal.InvalidOperation
+        return 0
+    return int(units) if units == units.to_integral_value() else 0
+
+
+def _hex_key(raw):
+    try:
+        return bytes.fromhex(raw)
+    except ValueError:
+        return b""  # check_config reports it
+
+
 DATA_DIR = Path(env("DATA_DIR", "./data"))
 TREASURY = env("TREASURY_ADDRESS", "")
 USDC_MINT = env("USDC_MINT", solana_pay.USDC_MAINNET)
-PRICE_UNITS = int(Decimal(env("PRICE_USDC_PER_HOUR", "25")) * 10**6)
+PRICE_UNITS = _price_units(env("PRICE_USDC_PER_HOUR", "25"))
 RPC_URL = env("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 ADMIN_WALLETS = {w.strip() for w in env("ADMIN_WALLETS", "").split(",") if w.strip()}
 ADMIN_TOKEN = env("ADMIN_TOKEN", "")
 ROBOT_TOKEN = env("ROBOT_TOKEN", "")
 SESSION_SECRET = env("SESSION_SECRET", "").encode()
-VAULT_MASTER = bytes.fromhex(env("VAULT_MASTER_KEY", ""))
+VAULT_MASTER = _hex_key(env("VAULT_MASTER_KEY", ""))
 MAX_UPLOAD = int(env("MAX_UPLOAD_MB", "2048")) * 2**20
 RESULTS_TTL = int(env("RESULTS_TTL_HOURS", "72")) * 3600
 OPERATOR_TZ = ZoneInfo(env("OPERATOR_TZ", "America/New_York"))
@@ -50,8 +70,10 @@ SESSION_TYPES = [t for t in env("SESSION_TYPES", "operator-run,remote-view").spl
 SITE_DOMAIN = env("SITE_DOMAIN", "localhost")
 SITE_ORIGIN = env("SITE_ORIGIN", "")          # the public booking site; proxies /api/* to this server
 PUBLIC_API_URL = env("PUBLIC_API_URL", "").rstrip("/")  # this server's own public URL, for direct transfers
-SECURE_COOKIE = env("SECURE_COOKIE", "1") == "1"
+SECURE_COOKIE = env("SECURE_COOKIE", "1") != "0"   # only an explicit "0" turns it off
 LINK_TTL = 600      # signed direct-transfer links live 10 minutes
+DISK_RESERVE = 512 * 2**20   # uploads never take the last 512 MB that SQLite and the OS need
+MAX_JSON_BODY = 64 * 1024    # every non-upload request body is tiny JSON
 MACHINE_ID = "72070072199752035588865179268289351973289970295321663729669764070389137395940"
 
 HOLD_S = 600        # unpaid slot hold
@@ -74,6 +96,8 @@ def check_config():
     problems = []
     if not _b58_32(TREASURY):
         problems.append("TREASURY_ADDRESS (Solana public key)")
+    if PRICE_UNITS <= 0:
+        problems.append("PRICE_USDC_PER_HOUR (> 0, at most 6 decimals)")
     if len(SESSION_SECRET) < 32:
         problems.append("SESSION_SECRET (>=32 chars)")
     if len(VAULT_MASTER) != 32:
@@ -205,16 +229,67 @@ def purge(con, bid, status="purged"):
                 (status, time.time(), bid))
 
 
+def expire_hold(con, bid, now=None):
+    """held -> expired in one transaction, only if it is still held. Returns False when the booking
+    moved on (a payment landed in between), so a cancel or the sweep can never clobber a payment."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        cur = con.execute("UPDATE bookings SET status='expired', vault_key=NULL, purged_at=? "
+                          "WHERE id=? AND status='held'", (now or time.time(), bid))
+        if cur.rowcount != 1:
+            con.execute("ROLLBACK")
+            return False
+        release_slots(con, bid)
+        con.execute("DELETE FROM files WHERE booking_id=?", (bid,))
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    vault.delete_booking(DATA_DIR, bid)  # holds never accept uploads; this only tidies an empty dir
+    return True
+
+
 def sweep(con, now=None):
     now = now or time.time()
     for (bid,) in con.execute("SELECT id FROM bookings WHERE status='held' AND hold_expires+?<?",
                               (GRACE_S, now)).fetchall():
-        release_slots(con, bid)
-        purge(con, bid, "expired")
+        expire_hold(con, bid, now)
     for (bid,) in con.execute("SELECT id FROM bookings WHERE status='complete' AND completed_at+?<?",
                               (RESULTS_TTL, now)).fetchall():
         purge(con, bid)
     con.execute("DELETE FROM nonces WHERE expires<?", (now,))
+
+
+def rescue_unreported(con, now=None):
+    """Janitor only (it calls RPC): before a lapsed hold is expired, look on chain for a payment the
+    browser never reported (tab closed mid-confirmation) and settle it, so it becomes paid or
+    needs_refund instead of silently expiring with the renter's money in the treasury."""
+    now = now or time.time()
+    held = con.execute("SELECT * FROM bookings WHERE status='held' AND hold_expires<?", (now,)).fetchall()
+    if not held:
+        return
+    if not _treasury_accounts:
+        _treasury_accounts.extend(solana_pay.token_accounts(RPC_URL, TREASURY, USDC_MINT))
+    found = {}
+    for account in _treasury_accounts:
+        found.update(solana_pay.memo_payments(RPC_URL, account))  # {booking_id: signature}
+    for b in held:
+        sig = found.get(b["id"])
+        if not sig or con.execute("SELECT 1 FROM bookings WHERE pay_sig=?", (sig,)).fetchone():
+            continue
+        try:
+            apply_payment(con, b, sig, solana_pay.fetch_tx(RPC_URL, sig))
+            log(f"rescued unreported payment for {b['id']}")
+        except HTTPException as e:
+            log(f"unreported tx for {b['id']} rejected: {e.detail}")
+
+
+# ponytail: recent-signature scan (memo_payments limit); page further back if the treasury gets busy.
+_treasury_accounts = []
+
+
+def log(*parts):
+    print(time.strftime("%Y-%m-%dT%H:%M:%S"), *parts, flush=True)
 
 
 def open_slots(con, now=None):
@@ -273,6 +348,13 @@ def apply_payment(con, b, sig, tx):
     now = time.time()
     con.execute("BEGIN IMMEDIATE")
     try:
+        # Re-read under the write lock: a cancel, the sweep, an admin refund or an overlapping /pay may
+        # have changed the row during the RPC round-trip. Deciding from the stale snapshot loses claims
+        # or the vault key, or turns an on-time payment into needs_refund.
+        b = booking_row(con, b["id"])
+        if b["status"] not in ("held", "expired"):
+            con.execute("ROLLBACK")
+            return b["status"]
         status = "paid"
         if reason == "late":
             status = "needs_refund"
@@ -292,6 +374,9 @@ def apply_payment(con, b, sig, tx):
     except sqlite3.IntegrityError:
         con.execute("ROLLBACK")
         raise HTTPException(409, "that transaction already paid for another booking")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
     return status
 
 
@@ -300,20 +385,34 @@ def _safe_name(name):
     return name or "file"
 
 
+# ponytail: per-process locks; render.yaml pins --workers 1. Move quota into SQL if it ever scales out.
+_upload_locks = defaultdict(asyncio.Lock)
+
+
 async def store_file(con, b, kind, name, request):
     # ponytail: encrypts on the event-loop thread; fine at one robot's traffic, offload if uploads pile up.
     if b["vault_key"] is None:
         raise HTTPException(409, "booking data already purged")
-    used = con.execute("SELECT COALESCE(SUM(size),0) FROM files WHERE booking_id=?", (b["id"],)).fetchone()[0]
-    fid = secrets.token_urlsafe(9)
-    try:
-        size = await vault.write_stream(vault.blob_path(DATA_DIR, b["id"], fid),
-                                        vault.unwrap(VAULT_MASTER, b["vault_key"]), fid,
-                                        request.stream(), MAX_UPLOAD - used)
-    except vault.TooLarge:
-        raise HTTPException(413, f"booking upload limit is {MAX_UPLOAD // 2**20} MB")
-    con.execute("INSERT INTO files(id, booking_id, kind, name, size, created) VALUES(?,?,?,?,?,?)",
-                (fid, b["id"], kind, _safe_name(name), size, time.time()))
+    # One upload per booking at a time, so parallel PUTs cannot each pass the quota check. Inputs and
+    # results have separate budgets: a renter filling theirs must not lock the robot's results out.
+    async with _upload_locks[b["id"]]:
+        used = con.execute("SELECT COALESCE(SUM(size),0) FROM files WHERE booking_id=? AND kind=?",
+                           (b["id"], kind)).fetchone()[0]
+        disk_left = shutil.disk_usage(DATA_DIR).free - DISK_RESERVE
+        if disk_left <= 0:
+            raise HTTPException(507, "server storage is full, try again later")
+        fid = secrets.token_urlsafe(9)
+        path = vault.blob_path(DATA_DIR, b["id"], fid)
+        try:
+            size = await vault.write_stream(path, vault.unwrap(VAULT_MASTER, b["vault_key"]), fid,
+                                            request.stream(), min(MAX_UPLOAD - used, disk_left))
+        except vault.TooLarge:
+            raise HTTPException(413, f"booking upload limit is {MAX_UPLOAD // 2**20} MB")
+        if booking_row(con, b["id"])["vault_key"] is None:  # purged while the bytes were arriving
+            vault.delete_booking(DATA_DIR, b["id"])
+            raise HTTPException(410, "booking data was purged during the upload")
+        con.execute("INSERT INTO files(id, booking_id, kind, name, size, created) VALUES(?,?,?,?,?,?)",
+                    (fid, b["id"], kind, _safe_name(name), size, time.time()))
     return {"id": fid, "name": _safe_name(name), "size": size, "kind": kind}
 
 
@@ -344,6 +443,10 @@ async def lifespan(app):
 
     def sweep_once():
         with db() as con:
+            try:
+                rescue_unreported(con)
+            except Exception as e:  # RPC trouble must never block expiry and purges
+                log("rescue error:", repr(e))
             sweep(con)
 
     async def janitor():
@@ -351,7 +454,7 @@ async def lifespan(app):
             try:
                 await asyncio.to_thread(sweep_once)
             except Exception as e:  # keep sweeping; a bad tick must not stop purges
-                print("sweep error:", e)
+                log("sweep error:", repr(e))
             await asyncio.sleep(60)
 
     task = asyncio.create_task(janitor())
@@ -360,6 +463,42 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+# Upload routes stream into the vault under its own quota; every other body is small JSON.
+STREAM_ROUTES = re.compile(r"^/(api/(admin|robot)/bookings/[^/]+/results|direct/upload/[^/]+)$")
+
+
+class BodyCap:
+    """Buffer non-upload request bodies up to MAX_JSON_BODY and answer 413 beyond it, so nobody can
+    make the server hold a huge body in memory before auth even runs."""
+
+    def __init__(self, inner, limit):
+        self.inner, self.limit = inner, limit
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS") \
+                or STREAM_ROUTES.match(scope["path"]):
+            return await self.inner(scope, receive, send)
+        msgs, size = [], 0
+        while True:
+            msg = await receive()
+            if msg["type"] != "http.request":  # client went away
+                return
+            size += len(msg.get("body", b""))
+            if size > self.limit:
+                return await JSONResponse({"detail": "request body too large"}, status_code=413)(scope, receive, send)
+            msgs.append(msg)
+            if not msg.get("more_body"):
+                break
+        replay = iter(msgs)
+
+        async def buffered():
+            return next(replay, None) or await receive()
+
+        await self.inner(scope, buffered, send)
+
+
+app.add_middleware(BodyCap, limit=MAX_JSON_BODY)
 
 
 @app.middleware("http")
@@ -375,7 +514,7 @@ async def headers(request, call_next):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "same-origin"
     resp.headers["Content-Security-Policy"] = (
-        "default-src 'self'; script-src 'self' https://esm.sh; connect-src 'self' https://esm.sh; "
+        "default-src 'self'; script-src 'self'; connect-src 'self'; "
         "img-src 'self' data:; media-src 'self'; style-src 'self'; font-src 'self'; frame-ancestors 'none'")
     return resp
 
@@ -503,10 +642,8 @@ def my_booking(bid: str, wallet=Depends(renter)):
 def cancel(bid: str, wallet=Depends(renter)):
     with db() as con:
         b = owned(con, bid, wallet)
-        if b["status"] != "held":
+        if b["status"] != "held" or not expire_hold(con, bid):
             raise HTTPException(409, "only unpaid holds can be cancelled here; contact us for refunds")
-        release_slots(con, bid)
-        purge(con, bid, "expired")
         return {}
 
 
@@ -529,25 +666,6 @@ def pay(bid: str, body: Pay, wallet=Depends(renter)):
         if status == "pending":
             return JSONResponse({"status": "pending"}, status_code=202)
         return booking_out(con, booking_row(con, bid))
-
-
-@app.put("/api/bookings/{bid}/files")
-async def upload(bid: str, name: str, request: Request, wallet=Depends(renter)):
-    with db() as con:
-        b = owned(con, bid, wallet)
-        if b["status"] not in ("paid", "active"):
-            raise HTTPException(409, "upload opens after payment and closes when the session ends")
-        return await store_file(con, b, "input", name, request)
-
-
-@app.get("/api/bookings/{bid}/files/{fid}")
-def download(bid: str, fid: str, wallet=Depends(renter)):
-    with db() as con:
-        owned(con, bid, wallet)
-        f = file_row(con, fid)
-        if f["booking_id"] != bid:
-            raise HTTPException(404, "no such file")
-        return send_file(con, f)
 
 
 # --- signed direct transfers ---------------------------------------------------------------------
@@ -639,6 +757,17 @@ TRANSITIONS = {  # action: (allowed from, to, timestamp column)
     "complete": (("active",), "complete", "completed_at"),
 }
 
+# Declared before the catch-all /{action} route below, which would otherwise match it first.
+@app.post("/api/admin/bookings/{bid}/peaq-posted")
+def peaq_posted(bid: str, body: PeaqPosted, who=Depends(admin)):
+    with db() as con:
+        booking_row(con, bid)
+        cur = con.execute("UPDATE bookings SET peaq_posted_at=?, peaq_ref=? WHERE id=? AND peaq_posted_at IS NULL",
+                          (time.time(), body.ref[:200], bid))
+        if cur.rowcount != 1:
+            raise HTTPException(409, "already posted to peaqOS")
+        return {}
+
 
 @app.post("/api/admin/bookings/{bid}/{action}")
 def admin_action(bid: str, action: str, who=Depends(admin)):
@@ -650,9 +779,13 @@ def admin_action(bid: str, action: str, who=Depends(admin)):
                 raise HTTPException(409, f"cannot {action} a {b['status']} booking")
             con.execute(f"UPDATE bookings SET status=?, {col}=? WHERE id=?", (to, time.time(), bid))
         elif action == "purge":
-            if b["status"] == "held":
-                raise HTTPException(409, "unpaid hold; let it expire")
-            purge(con, bid, b["status"] if b["status"] in ("needs_refund", "refunded") else "purged")
+            # Paid and running sessions must be refunded or completed first: purging them would wipe a
+            # live session or strand a paid slot with no money record.
+            if b["status"] in ("held", "paid", "active"):
+                raise HTTPException(409, f"cannot purge a {b['status']} booking; "
+                                         + ("let it expire" if b["status"] == "held" else
+                                            "mark it refunded" if b["status"] == "paid" else "complete it first"))
+            purge(con, bid, b["status"] if b["status"] in ("needs_refund", "refunded", "expired") else "purged")
         elif action == "refunded":
             if b["status"] not in ("paid", "needs_refund", "expired"):
                 raise HTTPException(409, f"cannot refund a {b['status']} booking")
@@ -681,19 +814,12 @@ def admin_download(fid: str, who=Depends(admin)):
 @app.get("/api/admin/peaq-pending")
 def peaq_pending(who=Depends(admin)):
     with db() as con:
+        # Only rentals that actually ran count as revenue; completed_at is always set for those.
         rows = con.execute("SELECT * FROM bookings WHERE pay_sig IS NOT NULL AND status IN ('complete','purged')"
-                           " AND peaq_posted_at IS NULL ORDER BY completed_at").fetchall()
+                           " AND completed_at IS NOT NULL AND peaq_posted_at IS NULL ORDER BY completed_at").fetchall()
         # USDC has 6 decimals; peaqOS revenue is USD minor units (cents).
         return [{"id": b["id"], "usd_cents": b["price_units"] // 10**4, "ts": int(b["completed_at"]),
                  "pay_sig": b["pay_sig"], "machine_id": MACHINE_ID} for b in rows]
-
-
-@app.post("/api/admin/bookings/{bid}/peaq-posted")
-def peaq_posted(bid: str, body: PeaqPosted, who=Depends(admin)):
-    with db() as con:
-        booking_row(con, bid)
-        con.execute("UPDATE bookings SET peaq_posted_at=?, peaq_ref=? WHERE id=?", (time.time(), body.ref[:200], bid))
-        return {}
 
 
 # --- robot -------------------------------------------------------------------------------------

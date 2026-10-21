@@ -1,0 +1,12 @@
+[Unit]
+Description=RAM-backed scratch for RAAS renter data (never touches the SSD, gone on reboot)
+
+[Mount]
+What=tmpfs
+Where=/mnt/raas
+Type=tmpfs
+# 2 GiB cap, only booster can enter, nothing in here is directly executable.
+Options=size=2G,mode=0700,uid=booster,gid=booster,noexec,nosuid,nodev
+
+[Install]
+WantedBy=multi-user.target

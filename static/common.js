@@ -1,4 +1,4 @@
-// Shared by the renter page and the admin console: API calls, Phantom sign-in, formatting.
+// Helpers for the operator console (admin.html): API calls, Phantom sign-in, formatting.
 export const $ = (sel, el = document) => el.querySelector(sel);
 
 export async function api(path, { method = 'GET', json, body, headers = {} } = {}) {
@@ -40,11 +40,9 @@ export async function signOut() {
 }
 
 export const short = (a) => (a ? `${a.slice(0, 4)}…${a.slice(-4)}` : '');
-export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const dtf = new Intl.DateTimeFormat(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 export const when = (unix) => (unix ? dtf.format(new Date(unix * 1000)) : '');
-export const hhmm = (unix) => new Date(unix * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 
 export function bytes(n) {
   const u = ['B', 'KB', 'MB', 'GB'];
@@ -75,11 +73,12 @@ export function el(tag, attrs = {}, ...kids) {
 
 // Upload with progress (fetch has no upload progress). Body is the raw file: the server encrypts
 // the stream as it arrives, so plaintext never lands in a temp file.
-export function put(url, file, onProgress) {
+export function put(url, file, onProgress, headers = {}) {
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
     x.open('PUT', url);
-    x.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
+    for (const [k, v] of Object.entries(headers)) x.setRequestHeader(k, v);
+    x.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
     x.onload = () => {
       let data = null;
       try { data = JSON.parse(x.responseText); } catch { /* non-JSON error page */ }

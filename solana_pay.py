@@ -3,6 +3,7 @@
 The browser is never trusted: the server re-reads the finalized transaction from RPC and checks it.
 """
 import json
+import re
 import urllib.request
 
 USDC_MAINNET = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -22,6 +23,28 @@ def rpc(url, method, params):
 def fetch_tx(url, signature):
     return rpc(url, "getTransaction", [signature, {
         "encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 0}])
+
+
+def token_accounts(url, owner, mint):
+    """The owner's token accounts for `mint` (the treasury's USDC account receives every payment)."""
+    res = rpc(url, "getTokenAccountsByOwner", [owner, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "finalized"}])
+    return [a["pubkey"] for a in res["value"]]
+
+
+MEMO_ID = re.compile(r"raas:([A-Za-z0-9_-]+)")
+
+
+def memo_payments(url, account, limit=100):
+    """{booking_id: signature} for recent successful txs touching `account` whose memo names a booking.
+    RPC renders memos as "[len] text", several joined by "; ". Candidates only: callers must still run
+    verify_usdc_payment on the full transaction."""
+    sigs = rpc(url, "getSignaturesForAddress", [account, {"limit": limit, "commitment": "finalized"}])
+    found = {}
+    for s in sigs:
+        if s.get("err") is None:
+            for bid in MEMO_ID.findall(s.get("memo") or ""):
+                found.setdefault(bid, s["signature"])
+    return found
 
 
 def verify_usdc_payment(tx, *, booking_id, treasury, mint, min_units, deadline):
