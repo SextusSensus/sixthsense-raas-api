@@ -1,0 +1,97 @@
+/* Static hero for the Base44 RAAS page (the Higgsfield build uses the scroll film instead). */
+/* The page owns the full viewport: no default body margin, brand background behind overscroll. */
+html,
+body {
+  margin: 0;
+  background: #121110;
+}
+.rx-hero {
+  position: relative;
+  display: grid;
+  align-items: center;
+  min-height: min(92vh, 860px);
+  padding: 120px clamp(16px, 4vw, 40px) 72px;
+  overflow: hidden;
+}
+.rx-hero-img {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 62% 40%;
+}
+.rx-hero::after {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  content: "";
+  background:
+    linear-gradient(90deg, rgb(18 17 16 / 0.94) 0%, rgb(18 17 16 / 0.62) 42%, rgb(18 17 16 / 0) 72%),
+    linear-gradient(0deg, var(--rx-bg) 0%, rgb(18 17 16 / 0) 28%);
+}
+.rx-hero-copy {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+.rx-hero-copy > * {
+  max-width: 560px;
+}
+.rx-hero-kicker {
+  margin: 0;
+  color: var(--rx-accent);
+  font-weight: 500;
+}
+.rx-hero h1 {
+  margin: 12px 0 20px;
+  font-size: clamp(40px, 6vw, 76px);
+  font-weight: 500;
+  font-stretch: 112%;
+  line-height: 1;
+  letter-spacing: -0.035em;
+}
+.rx-hero-lede {
+  margin: 0;
+  color: var(--rx-muted);
+  font-size: 18px;
+}
+.rx-hero-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 24px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.rx-hero-tags li {
+  padding: 5px 12px;
+  border: 1px solid var(--rx-line-strong);
+  border-radius: 999px;
+  color: var(--rx-text);
+  font-size: 13px;
+}
+.rx-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 32px;
+}
+.rx-hero-actions .rx-btn--ghost {
+  height: 44px;
+}
+@media (max-width: 720px) {
+  .rx-hero {
+    min-height: 0;
+    padding-top: 96px;
+  }
+  .rx-hero::after {
+    background: linear-gradient(0deg, var(--rx-bg) 8%, rgb(18 17 16 / 0.78) 55%, rgb(18 17 16 / 0.35) 100%);
+  }
+  .rx-hero-img {
+    object-position: 60% 30%;
+  }
+}

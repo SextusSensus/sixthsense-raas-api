@@ -41,10 +41,10 @@ services:
         value: America/New_York
       - key: SESSION_TYPES
         value: operator-run,remote-view
-      - key: SITE_DOMAIN
-        value: sixthsense-raas.higgsfield.app
-      - key: SITE_ORIGIN
-        value: https://sixthsense-raas.higgsfield.app
+      - key: SITE_DOMAIN             # shown in the Phantom sign-in message; where renters book
+        value: sixthsenselabs.xyz
+      - key: SITE_ORIGINS            # browser origins allowed to call the API with the session cookie
+        value: https://sixthsenselabs.xyz,https://www.sixthsenselabs.xyz,https://sixthsense-raas.higgsfield.app
       - key: PUBLIC_API_URL
         value: https://raas-api.sixthsenselabs.xyz
       - key: MAX_UPLOAD_MB

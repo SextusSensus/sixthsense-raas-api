@@ -15,7 +15,8 @@ pub = lambda k: base58.b58encode(bytes(k.verify_key)).decode()
 os.environ.update(DATA_DIR=str(TMP), TREASURY_ADDRESS=pub(TREASURY), SESSION_SECRET=secrets.token_hex(32),
                   VAULT_MASTER_KEY=secrets.token_hex(32), ADMIN_WALLETS=pub(ADMIN), ADMIN_TOKEN="adm",
                   ROBOT_TOKEN="bot", SECURE_COOKIE="0", OPERATOR_TZ="UTC", PRICE_USDC_PER_HOUR="25",
-                  RESULTS_TTL_HOURS="72", SESSION_TYPES="operator-run,remote-view")
+                  RESULTS_TTL_HOURS="72", SESSION_TYPES="operator-run,remote-view",
+                  SITE_ORIGINS="https://sixthsenselabs.xyz,https://sixthsense-raas.higgsfield.app")
 
 import solana_pay  # noqa: E402
 import server  # noqa: E402
@@ -230,6 +231,18 @@ def check_regressions():
         # 7. oversized JSON bodies are refused before any handler buffers them
         assert c.post("/api/auth/challenge", content=b"{" + b" " * 70_000 + b"}",
                       headers={"Content-Type": "application/json"}).status_code == 413
+
+        # 9. CORS: the Base44 page may call the API with its cookie; other origins may not
+        site, evil = "https://sixthsenselabs.xyz", "https://evil.example"
+        pre = c.options("/api/bookings", headers={"Origin": site, "Access-Control-Request-Method": "POST",
+                                                   "Access-Control-Request-Headers": "content-type"})
+        assert pre.status_code == 200 and pre.headers["access-control-allow-origin"] == site
+        assert pre.headers["access-control-allow-credentials"] == "true"
+        assert "access-control-allow-origin" not in c.options("/api/bookings", headers={
+            "Origin": evil, "Access-Control-Request-Method": "POST"}).headers
+        denied = c.get("/api/robot/jobs", headers={"Origin": site})  # errors carry CORS too
+        assert denied.status_code == 403 and denied.headers["access-control-allow-origin"] == site
+        assert "access-control-allow-origin" not in c.get("/api/config", headers={"Origin": evil}).headers
 
     # 8. fail closed on price and key parsing
     assert server._price_units("25") == 25_000_000 and server._price_units("1.5") == 1_500_000

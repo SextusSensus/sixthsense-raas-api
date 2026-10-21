@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 import base58
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
@@ -68,7 +69,11 @@ RESULTS_TTL = int(env("RESULTS_TTL_HOURS", "72")) * 3600
 OPERATOR_TZ = ZoneInfo(env("OPERATOR_TZ", "America/New_York"))
 SESSION_TYPES = [t for t in env("SESSION_TYPES", "operator-run,remote-view").split(",") if t]
 SITE_DOMAIN = env("SITE_DOMAIN", "localhost")
-SITE_ORIGIN = env("SITE_ORIGIN", "")          # the public booking site; proxies /api/* to this server
+# Sites that may call this API from the browser with the session cookie: the booking page on
+# sixthsenselabs.xyz (Base44, same site as raas-api.sixthsenselabs.xyz so the cookie stays first-party)
+# and the Higgsfield site (which proxies /api/* and only needs CORS for signed /direct/* transfers).
+SITE_ORIGINS = [o.strip().rstrip("/") for o in env("SITE_ORIGINS", env("SITE_ORIGIN", "")).split(",") if o.strip()]
+SITE_ORIGIN = SITE_ORIGINS[0] if SITE_ORIGINS else ""
 PUBLIC_API_URL = env("PUBLIC_API_URL", "").rstrip("/")  # this server's own public URL, for direct transfers
 SECURE_COOKIE = env("SECURE_COOKIE", "1") != "0"   # only an explicit "0" turns it off
 LINK_TTL = 600      # signed direct-transfer links live 10 minutes
@@ -504,19 +509,18 @@ app.add_middleware(BodyCap, limit=MAX_JSON_BODY)
 @app.middleware("http")
 async def headers(request, call_next):
     resp = await call_next(request)
-    if request.url.path.startswith("/direct/") and SITE_ORIGIN:
-        # Signed-link transfers are the only cross-origin calls; errors need CORS too or the
-        # browser hides why an upload failed.
-        resp.headers["Access-Control-Allow-Origin"] = SITE_ORIGIN
-        resp.headers["Access-Control-Allow-Methods"] = "PUT, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        resp.headers["Access-Control-Max-Age"] = "600"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "same-origin"
     resp.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self'; connect-src 'self'; "
         "img-src 'self' data:; media-src 'self'; style-src 'self'; font-src 'self'; frame-ancestors 'none'")
     return resp
+
+
+# Added last = outermost, so preflights and error responses (403/409/413) carry CORS headers too;
+# otherwise the browser hides why a call failed. Credentials only for the listed origins.
+app.add_middleware(CORSMiddleware, allow_origins=SITE_ORIGINS, allow_credentials=True,
+                   allow_methods=["GET", "POST", "PUT", "OPTIONS"], allow_headers=["Content-Type"], max_age=600)
 
 
 class Wallet(BaseModel):
@@ -702,11 +706,6 @@ def download_link(bid: str, fid: str, wallet=Depends(renter)):
             raise HTTPException(404, "no such file")
     exp = int(time.time()) + LINK_TTL
     return {"url": f"{PUBLIC_API_URL}/direct/download/{fid}?exp={exp}&sig={_sign('down', fid, exp)}"}
-
-
-@app.options("/direct/upload/{bid}")
-def direct_upload_preflight(bid: str):
-    return Response(status_code=204)  # CORS headers come from the middleware
 
 
 @app.put("/direct/upload/{bid}")
